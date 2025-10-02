@@ -17,7 +17,7 @@ import re
 decklists = pd.read_excel("PT_EOE_data.xlsx", sheet_name="Simplified_Decklists", 
                           engine="openpyxl")
 # The code below is better used on the round results sheets to convert lastname, firstname to decklists format
-# decklists['Player'] = decklists['Pilot'].apply(lambda x: " ".join(reversed(x.split(", "))) if ", " in x else x.strip())
+decklists['Player'] = decklists['Pilot'].apply(lambda x: " ".join(reversed(x.split(", "))) if ", " in x else x.strip())
 decklists = decklists[['Player', 'Deck']]
 
 # Compile match results from rounds 1-16
@@ -68,67 +68,55 @@ matches_df.loc[matches_df['Round'].isin(draft_rounds), 'Deck_B'] = 'DRAFT'
 # variable explorer issue in Spyder 5.4.5
 # matches_df.to_csv('test.csv', index=False)
 
-# Prepare for modeling
-players = pd.Index(pd.concat([matches_df['Player_A'], matches_df['Player_B']]).unique())
-decks = pd.Index(pd.concat([matches_df['Deck_A'], matches_df['Deck_B']]).unique())
+# Split data
+draft_df = matches_df[matches_df["Round"].isin(draft_rounds)].copy()
+constructed_df = matches_df[~matches_df["Round"].isin(draft_rounds)].copy()
 
+# Encode players and decks
+players = pd.Index(pd.concat([matches_df["Player_A"], matches_df["Player_B"]]).unique())
 player_to_idx = {name: i for i, name in enumerate(players)}
-deck_to_idx = {name: i for i, name in enumerate(decks)}
+draft_df["player_A_idx"] = draft_df["Player_A"].map(player_to_idx)
+draft_df["player_B_idx"] = draft_df["Player_B"].map(player_to_idx)
 
-matches_df["player_A_idx"] = matches_df["Player_A"].map(player_to_idx)
-matches_df["player_B_idx"] = matches_df["Player_B"].map(player_to_idx)
-matches_df["deck_A_idx"] = matches_df["Deck_A"].map(deck_to_idx)
-matches_df["deck_B_idx"] = matches_df["Deck_B"].map(deck_to_idx)
-
-# Build Bayesian model
-with pm.Model() as model:
+# Model 1: Draft rounds (player skill only)
+with pm.Model() as draft_model:
     player_skill = pm.Normal("player_skill", mu=0, sigma=1, shape=len(players))
-    deck_strength = pm.Normal("deck_strength", mu=0, sigma=1, shape=len(decks))
-
-    skill_diff = (player_skill[matches_df["player_A_idx"].values] + deck_strength[matches_df["deck_A_idx"].values]) - \
-                 (player_skill[matches_df["player_B_idx"].values] + deck_strength[matches_df["deck_B_idx"].values])
-
+    skill_diff = player_skill[draft_df["player_A_idx"].values] - player_skill[draft_df["player_B_idx"].values]
     win_prob = pm.Deterministic("win_prob", pm.math.sigmoid(skill_diff))
-    outcome = pm.Bernoulli("outcome", p=win_prob, observed=matches_df["Outcome"].values)
+    outcome = pm.Bernoulli("outcome", p=win_prob, observed=draft_df["Outcome"].values)
+    draft_trace = pm.sample(1000, tune=1000, target_accept=0.95, return_inferencedata=True)
 
-    trace = pm.sample(1000, tune=1000, target_accept=0.95, return_inferencedata=True)
+# Extract posterior summaries
+player_means = draft_trace.posterior["player_skill"].mean(dim=["chain", "draw"]).values
+player_stds = draft_trace.posterior["player_skill"].std(dim=["chain", "draw"]).values
+player_hdi = az.hdi(draft_trace, var_names=["player_skill"], hdi_prob=0.95)["player_skill"]
 
-# Use the trace object from PyMC sampling
-# Add coordinates to the trace for labeling
-trace.posterior = trace.posterior.assign_coords({
-    "player_skill_dim_0": list(players),
-    "deck_strength_dim_0": list(decks)
-})
+# Encode constructed data
+decks = pd.Index(pd.concat([constructed_df["Deck_A"], constructed_df["Deck_B"]]).unique())
+deck_to_idx = {name: i for i, name in enumerate(decks)}
+constructed_df["player_A_idx"] = constructed_df["Player_A"].map(player_to_idx)
+constructed_df["player_B_idx"] = constructed_df["Player_B"].map(player_to_idx)
+constructed_df["deck_A_idx"] = constructed_df["Deck_A"].map(deck_to_idx)
+constructed_df["deck_B_idx"] = constructed_df["Deck_B"].map(deck_to_idx)
 
-# Rename dimensions for clarity
-trace.posterior = trace.posterior.rename({
-    "player_skill_dim_0": "player",
-    "deck_strength_dim_0": "deck"
-})
+# Model 2: Constructed rounds (player skill + deck strength)
+with pm.Model() as constructed_model:
+    player_skill = pm.Normal("player_skill", mu=player_means, sigma=player_stds, shape=len(players))
+    deck_strength = pm.Normal("deck_strength", mu=0, sigma=1, shape=len(decks))
+    skill_diff = (player_skill[constructed_df["player_A_idx"].values] + deck_strength[constructed_df["deck_A_idx"].values]) - \
+                 (player_skill[constructed_df["player_B_idx"].values] + deck_strength[constructed_df["deck_B_idx"].values])
+    win_prob = pm.Deterministic("win_prob", pm.math.sigmoid(skill_diff))
+    outcome = pm.Bernoulli("outcome", p=win_prob, observed=constructed_df["Outcome"].values)
+    constructed_trace = pm.sample(1000, tune=1000, target_accept=0.95, return_inferencedata=True)
 
-# Plot player skills with names
-az.plot_forest(trace, var_names=["player_skill"], combined=True, figsize=(10, len(players) // 2))
-plt.title("Posterior Distributions of Player Skills")
-plt.tight_layout()
-plt.savefig("player_skills_named.png")
+# Extract final summaries
+player_summary = az.summary(constructed_trace, var_names=["player_skill"], round_to=4)
+deck_summary = az.summary(constructed_trace, var_names=["deck_strength"], round_to=4)
 
-# Plot deck strengths with names
-az.plot_forest(trace, var_names=["deck_strength"], combined=True, figsize=(10, len(decks) // 2))
-plt.title("Posterior Distributions of Deck Strengths")
-plt.tight_layout()
-plt.savefig("deck_strengths_named.png")
+# Add names
+player_summary["Player"] = players
+deck_summary["Deck"] = decks
 
-# Extract posterior mean estimates
-player_means = trace.posterior["player_skill"].mean(dim=["chain", "draw"]).values
-deck_means = trace.posterior["deck_strength"].mean(dim=["chain", "draw"]).values
-player_stds = trace.posterior["player_skill"].std(dim=["chain", "draw"]).values
-deck_stds = trace.posterior["deck_strength"].std(dim=["chain", "draw"]).values
-
-# Create DataFrames
-player_df = pd.DataFrame({"Player": list(players), "Skill_Estimate": player_means, "Skill_StD": player_stds})
-deck_df = pd.DataFrame({"Deck": list(decks), "Strength_Estimate": deck_means, "Strength_StD": deck_stds})
-
-# Save to CSV files
-player_df.to_csv("player_skill_estimates.csv", index=False)
-deck_df.to_csv("deck_strength_estimates.csv", index=False)
-
+# Save to CSV
+player_summary.to_csv("player_skill_estimates.csv", index=False)
+deck_summary.to_csv("deck_strength_estimates.csv", index=False)
